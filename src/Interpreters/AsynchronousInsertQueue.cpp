@@ -20,6 +20,8 @@
 #include <Interpreters/InterpreterInsertQuery.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/executeQuery.h>
+#include <Interpreters/InsertDeduplication.h>
+#include <Interpreters/StorageID.h>
 #include <Parsers/ASTInsertQuery.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/queryNormalization.h>
@@ -1192,7 +1194,6 @@ Chunk AsynchronousInsertQueue::processEntriesWithParsing(
         return 0;
     };
 
-
     StreamingFormatExecutor executor(
         header,
         format,
@@ -1200,7 +1201,8 @@ Chunk AsynchronousInsertQueue::processEntriesWithParsing(
         data->size_in_bytes,
         data->entries.size(),
         std::move(adding_defaults_transform));
-    auto chunk_info = std::make_shared<AsyncInsertInfo>();
+
+    auto deduplication_info = DeduplicationInfo::create(true);
 
     for (const auto & entry : data->entries)
     {
@@ -1219,14 +1221,8 @@ Chunk AsynchronousInsertQueue::processEntriesWithParsing(
 
         total_rows += num_rows;
 
-        /// For some reason, client can pass zero rows and bytes to server.
-        /// We don't update offsets in this case, because we assume every insert has some rows during dedup
-        /// but we have nothing to deduplicate for this insert.
-        if (num_rows > 0)
-        {
-            chunk_info->offsets.push_back(total_rows);
-            chunk_info->tokens.push_back(entry->async_dedup_token);
-        }
+        /// it is ok if total_rows is 0 here or async_dedup_token is empty
+        deduplication_info->setUserToken(entry->async_dedup_token, num_rows);
 
         add_to_async_insert_log(entry, current_exception, num_rows, num_bytes);
         current_exception.clear();
@@ -1234,7 +1230,7 @@ Chunk AsynchronousInsertQueue::processEntriesWithParsing(
     }
 
     Chunk chunk(executor.getResultColumns(), total_rows);
-    chunk.getChunkInfos().add(std::move(chunk_info));
+    chunk.getChunkInfos().add(std::move(deduplication_info));
     return chunk;
 }
 
@@ -1246,7 +1242,7 @@ Chunk AsynchronousInsertQueue::processPreprocessedEntries(
     LogFunc && add_to_async_insert_log)
 {
     size_t total_rows = 0;
-    auto chunk_info = std::make_shared<AsyncInsertInfo>();
+    auto deduplication_info = DeduplicationInfo::create(true);
     auto result_columns = header.cloneEmptyColumns();
 
     for (const auto & entry : data->entries)
@@ -1273,21 +1269,14 @@ Chunk AsynchronousInsertQueue::processPreprocessedEntries(
 
         total_rows += block_to_insert.rows();
 
-        /// For some reason, client can pass zero rows and bytes to server.
-        /// We don't update offsets in this case, because we assume every insert has some rows during dedup,
-        /// but we have nothing to deduplicate for this insert.
-        if (block_to_insert.rows() > 0)
-        {
-            chunk_info->offsets.push_back(total_rows);
-            chunk_info->tokens.push_back(entry->async_dedup_token);
-        }
+        deduplication_info->setUserToken(entry->async_dedup_token, block_to_insert.rows());
 
         add_to_async_insert_log(entry, /*parsing_exception=*/ "", block_to_insert.rows(), block_to_insert.bytes());
         entry->resetChunk();
     }
 
     Chunk chunk(std::move(result_columns), total_rows);
-    chunk.getChunkInfos().add(std::move(chunk_info));
+    chunk.getChunkInfos().add(std::move(deduplication_info));
     return chunk;
 }
 
