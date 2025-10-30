@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import List, Tuple
 
+from ci.jobs.scripts.find_tests import Targeting
 from ci.jobs.scripts.integration_tests_configs import IMAGES_ENV, get_optimal_test_batch
 from ci.praktika.info import Info
 from ci.praktika.result import Result
@@ -147,6 +148,7 @@ def main():
     is_bugfix_validation = False
     is_parallel = False
     is_sequential = False
+    is_targeted_check = False
     java_path = Shell.get_output(
         "update-alternatives --config java | sed -n 's/.*(providing \/usr\/bin\/java): //p'",
         verbose=True,
@@ -173,6 +175,8 @@ def main():
             is_sequential = True
         elif "bugfix" in to.lower() or "validation" in to.lower():
             is_bugfix_validation = True
+        elif "targeted" in to:
+            is_targeted_check = True
         else:
             assert False, f"Unknown job option [{to}]"
 
@@ -180,6 +184,8 @@ def main():
         repeat_option = (
             f"--count {args.count or FLAKY_CHECK_TEST_REPEAT_COUNT} --random-order"
         )
+    elif is_targeted_check:
+        repeat_option = f"--count 10 --random-order"
 
     if args.workers:
         workers = args.workers
@@ -187,11 +193,17 @@ def main():
         workers = min(ncpu // MAX_CPUS_PER_WORKER, mem_gb // MAX_MEM_PER_WORKER) or 1
 
     changed_test_modules = []
-    if is_bugfix_validation or is_flaky_check:
-        changed_files = info.get_changed_files()
-        for file in changed_files:
-            if file.startswith("tests/integration/test") and file.endswith(".py"):
-                changed_test_modules.append(file.removeprefix("tests/integration/"))
+    if is_bugfix_validation or is_flaky_check or is_targeted_check:
+        if info.is_local_run:
+            assert (
+                args.test
+            ), "--test must be provided for flaky or bugfix job flavor with local run"
+        else:
+            # TODO: reduce scope to modified test cases instead of entire modules
+            changed_files = info.get_changed_files()
+            for file in changed_files:
+                if file.startswith("tests/integration/test") and file.endswith(".py"):
+                    changed_test_modules.append(file.removeprefix("tests/integration/"))
 
     if is_bugfix_validation:
         if Utils.is_arm():
@@ -209,6 +221,28 @@ def main():
                 verbose=True,
                 strict=True,
             )
+
+    targeted_tests = []
+    if is_targeted_check:
+        assert not args.test, "--test not supposed to be used for targeted check ???"
+        targeter = Targeting(info=info)
+        tests, results_with_info = targeter.get_all_relevant_tests_with_info(ch_path)
+        results.append(results_with_info)
+        if not tests:
+            # early exit
+            Result.create_from(
+                status=Result.Status.SKIPPED,
+                info="No failed tests found from previous runs",
+            ).complete_job()
+
+        # Parse test names from the query result
+        for test_ in tests:
+            if test_.strip():
+                test_name = test_.strip()
+                targeted_tests.append(
+                    test_name.split("[")[0]
+                )  # remove parametrization - does not work with test repeat with --count
+        print(f"Parsed {len(targeted_tests)} test names: {targeted_tests}")
 
     clickhouse_path = f"{Utils.cwd()}/ci/tmp/clickhouse"
     clickhouse_server_config_dir = f"{Utils.cwd()}/programs/server"
@@ -246,21 +280,11 @@ def main():
     Shell.check("docker info > /dev/null", verbose=True, strict=True)
 
     parallel_test_modules, sequential_test_modules = tests_to_run(
-        batch_num, total_batches, args.test, workers
+        batch_num,
+        total_batches,
+        args.test or targeted_tests or changed_test_modules,
+        workers,
     )
-
-    if is_bugfix_validation or is_flaky_check:
-        # TODO: reduce scope to modified test cases instead of entire modules
-        sequential_test_modules = [
-            test_file
-            for test_file in changed_test_modules
-            if test_file in sequential_test_modules
-        ]
-        parallel_test_modules = [
-            test_file
-            for test_file in changed_test_modules
-            if test_file in parallel_test_modules
-        ]
 
     if is_sequential:
         parallel_test_modules = []
@@ -294,7 +318,10 @@ def main():
     has_error = False
     error_info = []
 
-    module_repeat_cnt = 1 if not is_flaky_check else FLAKY_CHECK_MODULE_REPEAT_COUNT
+    module_repeat_cnt = 1
+    if is_flaky_check:
+        module_repeat_cnt = FLAKY_CHECK_MODULE_REPEAT_COUNT
+
     if parallel_test_modules:
         for attempt in range(module_repeat_cnt):
             test_result_parallel = Result.from_pytest_run(
